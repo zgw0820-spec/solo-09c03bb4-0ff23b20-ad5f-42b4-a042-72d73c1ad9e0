@@ -154,6 +154,9 @@ textarea:focus, .file-drop:focus-within { outline: 2px solid var(--accent); outl
 
 .btn {
   appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: 1px solid transparent;
   border-radius: 9px;
   padding: 8px 14px;
@@ -164,6 +167,7 @@ textarea:focus, .file-drop:focus-within { outline: 2px solid var(--accent); outl
   color: #06101c;
   transition: transform 0.06s ease, filter 0.15s ease;
 }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .btn:hover:not(:disabled) { filter: brightness(1.08); }
 .btn:active:not(:disabled) { transform: translateY(1px); }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }

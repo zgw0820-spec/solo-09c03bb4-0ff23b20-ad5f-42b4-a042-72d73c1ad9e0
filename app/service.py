@@ -19,28 +19,84 @@ Invariants enforced inside every ``BEGIN IMMEDIATE`` SQLite transaction:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
+from pydantic import ValidationError
+
 from .db import Database
-from .schemas import TopologyIn
+from .schemas import (
+    BACKUP_FORMAT,
+    BACKUP_VERSION,
+    BackupEnvelope,
+    BackupState,
+    TopologyIn,
+)
 
 OPEN_DRAIN_STATUSES = ("active", "incomplete")
 BLOCKED_STATES = ("failed", "blocked")
 MAX_HISTORY_DRAINS = 12
+# Upper bound for an uploaded backup file; the data itself is far smaller.
+MAX_BACKUP_BYTES = 4 * 1024 * 1024
 
 
 class ApiError(Exception):
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        details: Any = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.details = details
 
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# --------------------------------------------------------------------------- #
+# Revision / generation bookkeeping
+# --------------------------------------------------------------------------- #
+#
+# ``revision`` increments on every committed mutation. An export reads it in
+# the same snapshot as the data, so a file is self-describing about the exact
+# committed state it came from. ``generation`` changes only when the whole
+# dataset is replaced (import / restore). Migration ids come from a sequence
+# that is *not* reset by a restore, but a stale browser tab only knows the
+# generation it rendered; resolve therefore requires that generation to match.
+
+
+def _meta_int(conn: sqlite3.Connection, key: str) -> int:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return int(row["value"]) if row is not None else 0
+
+
+def _bump(conn: sqlite3.Connection, key: str) -> int:
+    conn.execute(
+        "UPDATE meta SET value = value + 1 WHERE key = ?",
+        (key,),
+    )
+    return _meta_int(conn, key)
+
+
+def _mark_mutated(conn: sqlite3.Connection) -> None:
+    _bump(conn, "revision")
+
+
+def _mark_replaced(conn: sqlite3.Connection) -> None:
+    _bump(conn, "revision")
+    _bump(conn, "generation")
+
+
+def _generation(conn: sqlite3.Connection) -> int:
+    return _meta_int(conn, "generation")
 
 
 # --------------------------------------------------------------------------- #
@@ -417,6 +473,7 @@ def snapshot(db: Database) -> dict[str, Any]:
 
         return {
             "topology_loaded": bool(nodes),
+            "generation": _generation(conn),
             "nodes": node_payload,
             "containers": container_payload,
             "services": service_payload,
@@ -452,11 +509,14 @@ def _public_drain_row(row: sqlite3.Row) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-def _finalize_drain(conn: sqlite3.Connection, drain_id: int) -> None:
-    """Derive an open drain's status from the facts on the ground."""
+def _finalize_drain(conn: sqlite3.Connection, drain_id: int) -> bool:
+    """Derive an open drain's status from the facts on the ground.
+
+    Returns True when a stored flag was changed.
+    """
     drain = conn.execute("SELECT * FROM drains WHERE id = ?", (drain_id,)).fetchone()
     if drain is None or drain["status"] not in OPEN_DRAIN_STATUSES:
-        return
+        return False
     node_id = drain["node_id"]
     pending = conn.execute(
         "SELECT COUNT(*) AS n FROM migrations WHERE drain_id = ? AND state = 'starting'",
@@ -475,7 +535,7 @@ def _finalize_drain(conn: sqlite3.Connection, drain_id: int) -> None:
         new_status = "completed"
 
     if new_status == drain["status"]:
-        return
+        return False
     if new_status == "completed":
         conn.execute(
             "UPDATE drains SET status = 'completed', finished_at = ? WHERE id = ?",
@@ -501,6 +561,7 @@ def _finalize_drain(conn: sqlite3.Connection, drain_id: int) -> None:
             "UPDATE nodes SET status = 'draining' WHERE id = ? AND status != 'drained'",
             (node_id,),
         )
+    return True
 
 
 def reconcile(db: Database) -> None:
@@ -508,17 +569,19 @@ def reconcile(db: Database) -> None:
 
     Only touches bookkeeping flags; reservations and placements are untouched.
     """
+    changed = False
     with db.write() as conn:
         for drain in conn.execute(
             "SELECT id FROM drains WHERE status IN ('active','incomplete')"
         ).fetchall():
-            _finalize_drain(conn, drain["id"])
+            changed = _finalize_drain(conn, drain["id"]) or changed
         busy_nodes = _draining_node_ids(conn)
         for node in _node_rows(conn):
             if node["id"] in busy_nodes and node["status"] == "drained":
                 conn.execute(
                     "UPDATE nodes SET status = 'draining' WHERE id = ?", (node["id"],)
                 )
+                changed = True
             if node["id"] not in busy_nodes and node["status"] == "draining":
                 serving = conn.execute(
                     "SELECT COUNT(*) AS n FROM containers "
@@ -529,6 +592,9 @@ def reconcile(db: Database) -> None:
                 conn.execute(
                     "UPDATE nodes SET status = ? WHERE id = ?", (status, node["id"])
                 )
+                changed = True
+        if changed:
+            _mark_mutated(conn)
 
 
 # --------------------------------------------------------------------------- #
@@ -581,6 +647,7 @@ def import_topology(db: Database, topology: TopologyIn) -> dict[str, Any]:
                     position,
                 ),
             )
+        _mark_replaced(conn)
     return snapshot(db)
 
 
@@ -591,6 +658,7 @@ def reset(db: Database) -> dict[str, Any]:
         conn.execute("DELETE FROM containers")
         conn.execute("DELETE FROM services")
         conn.execute("DELETE FROM nodes")
+        _mark_replaced(conn)
     return snapshot(db)
 
 
@@ -772,6 +840,7 @@ def start_drain(db: Database, node_id: str) -> dict[str, Any]:
 
         _schedule(conn, drain_id, node_id)
         _finalize_drain(conn, drain_id)
+        _mark_mutated(conn)
     return snapshot(db)
 
 
@@ -810,6 +879,7 @@ def resume_drain(db: Database, node_id: str) -> dict[str, Any]:
         )
         _schedule(conn, drain["id"], node_id)
         _finalize_drain(conn, drain["id"])
+        _mark_mutated(conn)
     return snapshot(db)
 
 
@@ -846,14 +916,35 @@ def restore_node(db: Database, node_id: str) -> dict[str, Any]:
                 f"node {node_id!r} still has serving replicas",
             )
         conn.execute("UPDATE nodes SET status = 'ready' WHERE id = ?", (node_id,))
+        _mark_mutated(conn)
     return snapshot(db)
 
 
 def resolve_migration(
-    db: Database, migration_id: int, outcome: str, reason: str | None
+    db: Database,
+    migration_id: int,
+    outcome: str,
+    reason: str | None,
+    *,
+    expected_generation: int | None = None,
 ) -> dict[str, Any]:
-    """Simulate the new replica becoming ready (cutover) or failing to start."""
+    """Simulate the new replica becoming ready (cutover) or failing to start.
+
+    ``expected_generation`` is the dataset generation the caller last rendered.
+    Imports and restores replace the dataset and bump the generation, so a
+    decision issued by a page opened before that replacement is rejected even
+    if the migration id happens to exist again in the restored data.
+    """
     with db.write() as conn:
+        if (
+            expected_generation is not None
+            and expected_generation != _generation(conn)
+        ):
+            raise ApiError(
+                409,
+                "STALE_STATE",
+                "演练数据已被导入或恢复替换，请刷新页面后重新确认待决策任务",
+            )
         migration = conn.execute(
             "SELECT * FROM migrations WHERE id = ?", (migration_id,)
         ).fetchone()
@@ -929,4 +1020,385 @@ def resolve_migration(
             )
 
         _finalize_drain(conn, migration["drain_id"])
+        _mark_mutated(conn)
     return snapshot(db)
+
+
+# --------------------------------------------------------------------------- #
+# Backup export / restore
+# --------------------------------------------------------------------------- #
+
+
+def export_backup(db: Database) -> dict[str, Any]:
+    """Serialise the whole committed state from one consistent snapshot.
+
+    The read transaction starts before any table is touched, so a concurrent
+    drain/resolve either lands entirely before the file's state and revision or
+    entirely after it. There is never a mix of two committed states.
+    """
+    with db.read() as conn:
+        revision = _meta_int(conn, "revision")
+        state = BackupState(
+            nodes=[
+                {**dict(row)} for row in conn.execute("SELECT * FROM nodes").fetchall()
+            ],
+            services=[
+                {**dict(row)}
+                for row in conn.execute("SELECT * FROM services").fetchall()
+            ],
+            containers=[
+                {**dict(row)}
+                for row in conn.execute("SELECT * FROM containers").fetchall()
+            ],
+            drains=[
+                {**dict(row)}
+                for row in conn.execute("SELECT * FROM drains").fetchall()
+            ],
+            migrations=[
+                {**dict(row)}
+                for row in conn.execute("SELECT * FROM migrations").fetchall()
+            ],
+        )
+        envelope = {
+            "format": BACKUP_FORMAT,
+            "version": BACKUP_VERSION,
+            "exported_at": utcnow(),
+            "revision": revision,
+            "state": state.model_dump(mode="json"),
+        }
+    # Re-validate what we are about to hand out: an export can never produce a
+    # file the importer would reject for structural reasons.
+    BackupEnvelope.model_validate(envelope)
+    return envelope
+
+
+def _validation_details(exc: ValidationError) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for item in exc.errors():
+        location = ".".join(str(part) for part in item.get("loc", ()))
+        message = item.get("msg", "invalid value")
+        for prefix in ("Value error, ", "Assertion failed, "):
+            if message.startswith(prefix):
+                message = message[len(prefix):]
+        details.append(
+            {
+                "field": location or "body",
+                "message": message,
+                "type": item.get("type", "value_error"),
+            }
+        )
+    return details
+
+
+def _restore_semantic_checks(state: BackupState) -> list[str]:
+    """Cross-row invariants the database schema alone cannot express."""
+    problems: list[str] = []
+    nodes = {node.id: node for node in state.nodes}
+    services = {service.name: service for service in state.services}
+    containers = {container.id: container for container in state.containers}
+    drains = {drain.id: drain for drain in state.drains}
+
+    # Services must exactly match the containers that reference them, and the
+    # min_ready rule from a normal import still applies.
+    referenced_services = {container.service for container in state.containers}
+    for name in sorted(referenced_services - set(services)):
+        problems.append(f"容器引用了备份中不存在的业务 {name!r}")
+    for name in sorted(set(services) - referenced_services):
+        problems.append(f"业务 {name!r} 没有被任何容器使用")
+    replicas: dict[str, int] = {}
+    for container in state.containers:
+        replicas[container.service] = replicas.get(container.service, 0) + 1
+    for name, service in services.items():
+        if service.min_ready > replicas.get(name, 0):
+            problems.append(
+                f"业务 {name!r} 要求 min_ready={service.min_ready}，"
+                f"但只有 {replicas.get(name, 0)} 个容器"
+            )
+
+    per_node: dict[str, int] = {node_id: 0 for node_id in nodes}
+    for container in state.containers:
+        per_node[container.node_id] += container.cpu_request
+    for node_id, used in per_node.items():
+        if used > nodes[node_id].cpu_capacity:
+            problems.append(
+                f"节点 {node_id!r} 的服务副本请求 {used} 超过容量 "
+                f"{nodes[node_id].cpu_capacity}"
+            )
+
+    # Drains: a node has at most one open drain, open drains belong to draining
+    # nodes, finished drains may not still be open.
+    open_by_node: dict[str, int] = {}
+    for drain in state.drains:
+        if drain.status != "completed":
+            open_by_node[drain.node_id] = open_by_node.get(drain.node_id, 0) + 1
+            if nodes[drain.node_id].status != "draining":
+                problems.append(
+                    f"排空 {drain.id} 未完成，但节点 {drain.node_id!r} 状态为 "
+                    f"{nodes[drain.node_id].status!r}"
+                )
+            if drain.finished_at is not None:
+                problems.append(f"未完成的排空 {drain.id} 不应有结束时间")
+        else:
+            if drain.finished_at is None:
+                problems.append(f"已完成的排空 {drain.id} 缺少结束时间")
+    for node in state.nodes:
+        if node.status == "draining" and node.id not in open_by_node:
+            problems.append(f"节点 {node.id!r} 状态为排空中，但没有未完成的排空")
+    for node_id, count in open_by_node.items():
+        if count > 1:
+            problems.append(f"节点 {node_id!r} 同时存在 {count} 个未完成的排空")
+
+    # Migrations: no attempt may reference a drain on a different node, and an
+    # attempt outlives its container only as history if it never "starting".
+    for migration in sorted(state.migrations, key=lambda item: item.id):
+        drain = drains[migration.drain_id]
+        if drain.node_id != migration.source_node_id:
+            problems.append(
+                f"迁移 {migration.id} 的源节点与排空 {drain.id} 的节点不一致"
+            )
+        if migration.target_node_id == migration.source_node_id:
+            problems.append(f"迁移 {migration.id} 的目标节点与源节点相同")
+        if migration.state == "starting":
+            if migration.target_node_id is None:
+                problems.append(f"迁移 {migration.id} 正在启动但没有目标节点")
+            if drains[migration.drain_id].status == "completed":
+                problems.append(
+                    f"迁移 {migration.id} 仍预留容量，但它所属的排空已完成"
+                )
+        if migration.state == "completed" and migration.target_node_id is None:
+            problems.append(f"已完成的迁移 {migration.id} 缺少目标节点")
+
+    # A pending reservation must correspond to a real container that still
+    # serves on the source node, and every node's reservations must fit.
+    starting_by_container: dict[str, int] = {}
+    reserved_per_node: dict[str, int] = {node_id: 0 for node_id in nodes}
+    for migration in state.migrations:
+        if migration.state != "starting":
+            continue
+        container = containers.get(migration.container_id)
+        if container is None:
+            problems.append(
+                f"迁移 {migration.id} 正在启动，但容器 "
+                f"{migration.container_id!r} 不存在"
+            )
+            continue
+        if container.node_id != migration.source_node_id:
+            problems.append(
+                f"迁移 {migration.id} 的旧副本已不在源节点 {migration.source_node_id!r}"
+            )
+        if migration.reserved_cpu != container.cpu_request:
+            problems.append(
+                f"迁移 {migration.id} 预留 {migration.reserved_cpu} CPU，"
+                f"与容器请求 {container.cpu_request} 不符"
+            )
+        starting_by_container[container.id] = (
+            starting_by_container.get(container.id, 0) + 1
+        )
+        if migration.target_node_id is not None:
+            reserved_per_node[migration.target_node_id] += migration.reserved_cpu
+            if nodes[migration.target_node_id].status != "ready":
+                problems.append(
+                    f"迁移 {migration.id} 的目标节点 "
+                    f"{migration.target_node_id!r} 不是可用状态"
+                )
+    for container_id, count in starting_by_container.items():
+        if count > 1:
+            problems.append(f"容器 {container_id!r} 同时有多个新副本在启动")
+    for node_id, reserved in reserved_per_node.items():
+        used = per_node.get(node_id, 0) + reserved
+        if used > nodes[node_id].cpu_capacity:
+            problems.append(
+                f"节点 {node_id!r} 服务负载加预留 {used} 超过容量 "
+                f"{nodes[node_id].cpu_capacity}"
+            )
+    return problems
+
+
+def validate_backup_payload(raw: Any) -> BackupEnvelope:
+    """Parse an uploaded backup without touching the database."""
+    if not isinstance(raw, dict):
+        raise ApiError(422, "INVALID_BACKUP", "备份文件顶层必须是 JSON 对象")
+    try:
+        envelope = BackupEnvelope.model_validate(raw)
+    except ValidationError as exc:
+        raise ApiError(
+            422,
+            "INVALID_BACKUP",
+            "备份文件校验失败：字段缺失、类型错误或引用关系无效",
+            _validation_details(exc),
+        ) from exc
+    problems = _restore_semantic_checks(envelope.state)
+    if problems:
+        raise ApiError(
+            422,
+            "INVALID_BACKUP",
+            "备份文件校验失败：数据之间不自洽",
+            [{"field": "state", "message": p, "type": "value_error"} for p in problems],
+        )
+    return envelope
+
+
+def restore_backup(db: Database, raw: Any) -> dict[str, Any]:
+    """Validate, then replace the whole simulation in one transaction.
+
+    A validation error or any failure while writing rolls back, leaving the
+    current rehearsal exactly as it was. The replacement is serialised with
+    every command through ``BEGIN IMMEDIATE``, so a concurrent drain either
+    commits before the restore or after it.
+    """
+    envelope = validate_backup_payload(raw)
+    state = envelope.state
+    # Re-check inside the write transaction: the check is pure, and doing it
+    # again makes the "validate then replace" story airtight even if callers
+    # use this function directly.
+    problems = _restore_semantic_checks(state)
+    if problems:
+        raise ApiError(
+            422,
+            "INVALID_BACKUP",
+            "备份文件校验失败：数据之间不自洽",
+            [{"field": "state", "message": p, "type": "value_error"} for p in problems],
+        )
+
+    try:
+        with db.write() as conn:
+            conn.execute("DELETE FROM migrations")
+            conn.execute("DELETE FROM drains")
+            conn.execute("DELETE FROM containers")
+            conn.execute("DELETE FROM services")
+            conn.execute("DELETE FROM nodes")
+
+            for node in state.nodes:
+                conn.execute(
+                    "INSERT INTO nodes (id, name, cpu_capacity, status, position) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (node.id, node.name, node.cpu_capacity, node.status, node.position),
+                )
+            for service in state.services:
+                conn.execute(
+                    "INSERT INTO services (name, min_ready, position) VALUES (?, ?, ?)",
+                    (service.name, service.min_ready, service.position),
+                )
+            for container in state.containers:
+                conn.execute(
+                    "INSERT INTO containers "
+                    "(id, name, service, cpu_request, node_id, status, position) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        container.id,
+                        container.name,
+                        container.service,
+                        container.cpu_request,
+                        container.node_id,
+                        container.status,
+                        container.position,
+                    ),
+                )
+            for drain in state.drains:
+                conn.execute(
+                    "INSERT INTO drains (id, node_id, status, created_at, finished_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        drain.id,
+                        drain.node_id,
+                        drain.status,
+                        drain.created_at,
+                        drain.finished_at,
+                    ),
+                )
+            for migration in state.migrations:
+                conn.execute(
+                    "INSERT INTO migrations "
+                    "(id, drain_id, container_id, source_node_id, target_node_id, "
+                    "state, reserved_cpu, error_code, error, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        migration.id,
+                        migration.drain_id,
+                        migration.container_id,
+                        migration.source_node_id,
+                        migration.target_node_id,
+                        migration.state,
+                        migration.reserved_cpu,
+                        migration.error_code,
+                        migration.error,
+                        migration.created_at,
+                        migration.updated_at,
+                    ),
+                )
+            # Ids in the file may exceed sequences left behind by the previous
+            # dataset; keep AUTOINCREMENT from reissuing them (and from colliding
+            # with a stale page's id).
+            for table in ("drains", "migrations"):
+                row = conn.execute(f"SELECT MAX(id) AS m FROM {table}").fetchone()
+                if row["m"] is None:
+                    continue
+                exists = conn.execute(
+                    "SELECT 1 FROM sqlite_sequence WHERE name = ?", (table,)
+                ).fetchone()
+                if exists is None:
+                    conn.execute(
+                        "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                        (table, row["m"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = ?",
+                        (row["m"], table),
+                    )
+            # Derived statuses must agree with the restored facts; this validates
+            # the file instead of silently rewriting derived flags. Any mismatch
+            # aborts the transaction, so the previous rehearsal stays intact.
+            mismatches = _restore_consistency_problems(conn)
+            if mismatches:
+                raise ApiError(
+                    422,
+                    "INVALID_BACKUP",
+                    "备份文件校验失败：派生状态与事实不一致",
+                    [
+                        {"field": "state", "message": p, "type": "value_error"}
+                        for p in mismatches
+                    ],
+                )
+            _mark_replaced(conn)
+    except sqlite3.Error as exc:
+        # The write context rolled back; the previous rehearsal is untouched.
+        raise ApiError(
+            500,
+            "RESTORE_FAILED",
+            f"恢复失败，当前演练未改变：{exc}",
+        ) from exc
+    return snapshot(db)
+
+
+def _restore_consistency_problems(conn: sqlite3.Connection) -> list[str]:
+    """Derived-state invariants checked after a restore."""
+    problems: list[str] = []
+    usage = _usage(conn)
+    for node in _node_rows(conn):
+        used = usage.get(node["id"], {"serving": 0, "reserved": 0})
+        total = used["serving"] + used["reserved"]
+        if total > node["cpu_capacity"]:
+            problems.append(f"节点 {node['id']!r} 负载 {total} 超过容量")
+        serving = conn.execute(
+            "SELECT COUNT(*) AS n FROM containers WHERE node_id = ?",
+            (node["id"],),
+        ).fetchone()["n"]
+        open_drain = _open_drain_for_node(conn, node["id"])
+        if node["status"] == "drained" and (serving or total or open_drain):
+            problems.append(f"节点 {node['id']!r} 标为已空但仍有副本或预留")
+        if open_drain is not None and node["status"] != "draining":
+            problems.append(f"节点 {node['id']!r} 有未完成排空但状态不是排空中")
+    for drain in _open_drains(conn):
+        pending = conn.execute(
+            "SELECT COUNT(*) AS n FROM migrations WHERE drain_id = ? "
+            "AND state = 'starting'",
+            (drain["id"],),
+        ).fetchone()["n"]
+        serving = conn.execute(
+            "SELECT COUNT(*) AS n FROM containers WHERE node_id = ?",
+            (drain["node_id"],),
+        ).fetchone()["n"]
+        if pending == 0 and serving == 0:
+            problems.append(f"排空 {drain['id']} 没有待决策任务也没有副本，应为已完成")
+    return problems

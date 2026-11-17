@@ -29,6 +29,25 @@ DATABASE_PATH=./data/rehearsal.db SEED_TOPOLOGY=./examples/cluster.json \
 4. 「受阻容器」面板列出旧副本仍在服务的容器及原因；修正容量后点节点上的「继续」重试。
 5. 节点上没有任何服务副本后才会显示「已空」；进度条与“节点上剩余副本”分开统计，未就绪的新副本不计入业务就绪数。
 6. 演练后点「恢复」可把已空节点放回可用池，便于反复演练。
+7. 左侧「备份与恢复」：点「下载备份」得到 JSON 文件；点「上传恢复」选择先前下载的文件，确认后整体替换当前演练。
+
+## 备份与恢复
+
+备份是单个 JSON 文件，`format` 为 `node-drain-backup`、`version` 为 `1`，包含：
+
+- 节点（含容量与状态）、业务、容器及其所在节点；
+- 全部排空任务（含已完成的历史）与全部迁移尝试；
+- 未决（`starting`）迁移的目标节点与 CPU 预留，因此恢复后仍可决策；
+- 导出时的 `revision`，即该文件对应的已提交状态序号。
+
+一致性保证：
+
+- **同一已提交状态**：导出在单个读事务内读取全部表与 `revision`。导出与另一实例的迁移判定并发时，文件要么完全早于该次判定，要么完全晚于它，不会混合两个状态。
+- **先校验后替换**：恢复先做字段/类型校验，再校验引用关系（容器→节点/业务、迁移→排空/容器/节点）、容量（服务负载与预留之和不超过容量）、未决预留与旧副本及容器请求匹配、未完成排空与节点状态一致等。全部通过后才在一个 `BEGIN IMMEDIATE` 事务中删除并重建；任何失败都会回滚，原演练、历史与预留保持不变。
+- **与排空并发**：恢复和所有写命令共用 SQLite 写锁，按提交顺序生效，不会出现恢复与排空各写一半。
+- **旧页面不会误操作**：导入、恢复（以及重置）会提升 `generation`；迁移判定请求携带页面渲染时的 `generation`，不匹配时返回 `409 STALE_STATE`。恢复时还会把 `drains`/`migrations` 的 AUTOINCREMENT 序列推进到文件中的最大 id，避免新任务复用旧 id。
+
+数据自洽失败返回 `422 INVALID_BACKUP`，写入失败返回 `500 RESTORE_FAILED`，两者都不改变当前状态。
 
 ## JSON 格式
 
@@ -62,8 +81,10 @@ DATABASE_PATH=./data/rehearsal.db SEED_TOPOLOGY=./examples/cluster.json \
 | POST | `/api/nodes/{node_id}/drain` | 发起排空 |
 | POST | `/api/nodes/{node_id}/resume` | 重试未完成排空的受阻副本 |
 | POST | `/api/nodes/{node_id}/restore` | 把已空节点恢复为可用 |
-| POST | `/api/migrations/{migration_id}/resolve` | `{"outcome":"ready"\|"failed","reason":"..."}` |
+| POST | `/api/migrations/{migration_id}/resolve` | `{"outcome":"ready"\|"failed","reason":"..."}`；可带 `?generation=N` 拒绝旧页面的判定 |
 | GET | `/api/drains/{drain_id}` | 单个排空任务进度 |
+| GET | `/api/backup` | 下载当前已提交状态的备份 JSON |
+| POST | `/api/backup/restore` | 上传备份 JSON，校验后原子替换演练 |
 | GET | `/healthz` | 健康检查 |
 
 错误统一返回 `{"error": {"code": "...", "message": "..."}}`，校验失败时额外带 `details` 列表。
@@ -86,3 +107,4 @@ python3 -m pytest tests -q
 ```
 
 `tests/test_flow.py` 覆盖：导入校验、预留与就绪口径、成功切换、启动失败保底、无可行落点、并发排空不超额、重启续作、未完成排空不误报“已空”、受阻重试、已空节点恢复。
+`tests/test_backup.py` 覆盖：备份内容含未决预留、导出与判定交错时的单状态一致性、跨实例恢复后未决任务仍可决策、恢复后 id 不复用、旧页面判定被拒绝、无效文件/写入失败不改原状态、恢复与排空并发按提交顺序生效。

@@ -7,6 +7,14 @@ from typing import Iterator
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
+
+INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', 0);
+INSERT OR IGNORE INTO meta (key, value) VALUES ('generation', 0);
+
 CREATE TABLE IF NOT EXISTS nodes (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -76,7 +84,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_one_starting_migration_per_container
 
 class Database:
     """Small SQLite helper that opens short-lived, transaction-scoped connections."""
-
     def __init__(self, path: str | Path) -> None:
         self.path = str(path)
 

@@ -8,7 +8,7 @@ from typing import Any
 
 from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import service
@@ -93,7 +93,7 @@ def create_app(
     async def api_error_handler(_: Request, exc: service.ApiError) -> JSONResponse:
         return JSONResponse(
             status_code=exc.status_code,
-            content=_error_payload(exc.code, exc.message),
+            content=_error_payload(exc.code, exc.message, exc.details),
         )
 
     @app.exception_handler(RequestValidationError)
@@ -103,6 +103,9 @@ def create_app(
         if request.url.path == "/api/topology":
             code = "INVALID_TOPOLOGY"
             message = "导入数据校验失败，请检查字段、数量上限和容量约束"
+        elif request.url.path == "/api/backup/restore":
+            code = "INVALID_BACKUP"
+            message = "备份文件不是有效的 JSON 或格式不正确"
         else:
             code = "INVALID_REQUEST"
             message = "请求参数校验失败"
@@ -151,15 +154,61 @@ def create_app(
 
     @app.post("/api/migrations/{migration_id}/resolve")
     def resolve_migration(
-        migration_id: int, request: ResolveRequest
+        migration_id: int,
+        request: ResolveRequest,
+        generation: int | None = None,
     ) -> dict[str, Any]:
         return service.resolve_migration(
-            database, migration_id, request.outcome, request.reason
+            database,
+            migration_id,
+            request.outcome,
+            request.reason,
+            expected_generation=generation,
         )
 
     @app.get("/api/drains/{drain_id}")
     def get_drain(drain_id: int) -> dict[str, Any]:
         return service.get_drain(database, drain_id)
+
+    @app.get("/api/backup")
+    def download_backup() -> Response:
+        """Download the committed rehearsal state as a JSON file."""
+        payload = service.export_backup(database)
+        stamp = (
+            payload["exported_at"]
+            .replace("+00:00", "Z")
+            .replace(":", "")
+            .replace("-", "")
+        )
+        filename = f"node-drain-backup-{stamp}.json"
+        return Response(
+            content=json.dumps(payload, ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @app.post("/api/backup/restore")
+    async def upload_backup(request: Request) -> dict[str, Any]:
+        """Restore a previously downloaded backup, replacing the rehearsal."""
+        body = await request.body()
+        if not body:
+            raise service.ApiError(422, "INVALID_BACKUP", "上传内容为空")
+        if len(body) > service.MAX_BACKUP_BYTES:
+            raise service.ApiError(
+                413,
+                "BACKUP_TOO_LARGE",
+                f"备份文件超过 {service.MAX_BACKUP_BYTES // (1024 * 1024)} MB 上限",
+            )
+        try:
+            raw = json.loads(body)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise service.ApiError(
+                422, "INVALID_BACKUP", f"备份文件不是有效的 JSON：{exc}"
+            ) from exc
+        return service.restore_backup(database, raw)
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

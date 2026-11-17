@@ -26,6 +26,10 @@ const STATE = {
   lastRefresh: null,
   reasonDrafts: {},
   pausedUntil: 0,
+  // Generation of the dataset this page is rendering. Sent with every
+  // migration decision so a page left open across an import/restore cannot
+  // act on tasks created afterwards.
+  generation: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -49,6 +53,9 @@ const REASON_LABELS = {
   REPLICA_START_FAILED: "新副本模拟启动失败",
   RESERVATION_LOST: "目标容量预留失效",
 };
+
+const BACKUP_FORMAT = "node-drain-backup";
+const BACKUP_VERSION = 1;
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
@@ -106,7 +113,7 @@ function formatApiError(payload, status) {
     const lines = details
       .map((item) => `${item.field}: ${item.message}`)
       .join("\n");
-    return `导入失败 (${payload.error.code})\n${lines}`;
+    return `${payload.error.code}: ${payload.error.message}\n${lines}`;
   }
   return `${payload.error.code}: ${payload.error.message}`;
 }
@@ -117,6 +124,7 @@ function applyState(data) {
     STATE.reasonDrafts[input.dataset.reasonFor] = input.value;
   });
   STATE.data = data;
+  STATE.generation = data.generation;
   STATE.lastRefresh = new Date();
   if (STATE.selectedNode) {
     const exists = data.nodes.some((node) => node.id === STATE.selectedNode);
@@ -318,13 +326,17 @@ function migrationCard(data, migration, drain, { allowActions }) {
   const state = migration.state;
   const reason =
     REASON_LABELS[migration.error_code] || migration.error || "";
+  // Pin the rendered dataset generation to the buttons. If the rehearsal is
+  // replaced before the click lands, the server rejects it rather than acting
+  // on a different task that happens to reuse the id.
+  const generation = escapeHtml(data.generation ?? "");
   const actionBlock =
     state === "starting" && allowActions
       ? `<div class="migration-actions">
            <input type="text" maxlength="200" placeholder="可填写失败原因（可选）"
              data-reason-for="${migration.id}" />
-           <button class="btn small ok" data-action="resolve-ready" data-migration="${migration.id}">新副本就绪</button>
-           <button class="btn small danger" data-action="resolve-failed" data-migration="${migration.id}">模拟启动失败</button>
+           <button class="btn small ok" data-action="resolve-ready" data-migration="${migration.id}" data-generation="${generation}">新副本就绪</button>
+           <button class="btn small danger" data-action="resolve-failed" data-migration="${migration.id}" data-generation="${generation}">模拟启动失败</button>
          </div>`
       : "";
   const retryBlock =
@@ -582,6 +594,148 @@ function hideImportError() {
 }
 
 // ---------------------------------------------------------------------------
+// Backup / restore
+// ---------------------------------------------------------------------------
+
+function showBackupError(message, { ok = false } = {}) {
+  const el = $("backup-error");
+  el.textContent = message;
+  el.classList.remove("hidden");
+  el.classList.toggle("ok", ok);
+}
+
+function hideBackupError() {
+  const el = $("backup-error");
+  el.classList.add("hidden");
+  el.classList.remove("ok");
+  el.textContent = "";
+}
+
+function backupFilename() {
+  const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "");
+  return `node-drain-backup-${stamp}.json`;
+}
+
+async function downloadBackup() {
+  if (STATE.busy) return;
+  setBusy(true);
+  hideBackupError();
+  try {
+    const response = await fetch("/api/backup", { headers: { Accept: "application/json" } });
+    if (!response.ok) {
+      let payload = null;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+      throw new Error(formatApiError(payload, response.status));
+    }
+    const text = await response.text();
+    // Round-trip the downloaded file through the same parser the importer
+    // uses, so a corrupt export is caught before it is handed to the operator.
+    const parsed = JSON.parse(text);
+    if (parsed?.format !== BACKUP_FORMAT || parsed?.version !== BACKUP_VERSION) {
+      throw new Error("服务端返回的备份格式不受支持");
+    }
+    const blob = new Blob([text], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = backupFilename();
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showBackupError(
+      `备份已下载：${parsed.state.nodes.length} 节点 / ${parsed.state.containers.length} 容器 / ` +
+        `${parsed.state.drains.length} 个排空任务，` +
+        `${parsed.state.migrations.filter((m) => m.state === "starting").length} 个未决预留`,
+      { ok: true }
+    );
+  } catch (error) {
+    showBackupError(`下载失败：${error.message}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function restoreBackup(file) {
+  if (!file || STATE.busy) return;
+  hideBackupError();
+  if (file.size > 4 * 1024 * 1024) {
+    showBackupError("备份文件超过 4 MB 上限");
+    return;
+  }
+  let raw;
+  try {
+    raw = JSON.parse(await file.text());
+  } catch (error) {
+    showBackupError(`备份文件不是有效的 JSON：${error.message}`);
+    return;
+  }
+  if (!raw || raw.format !== BACKUP_FORMAT || raw.version !== BACKUP_VERSION) {
+    showBackupError("不是本系统导出的备份文件（format/version 不匹配）");
+    return;
+  }
+  const state = STATE.data;
+  const summary =
+    raw.state?.nodes && raw.state?.containers
+      ? `${raw.state.nodes.length} 节点、${raw.state.containers.length} 容器、` +
+        `${raw.state.drains.length} 个排空任务`
+      : "未知内容";
+  if (
+    state?.topology_loaded &&
+    !window.confirm(
+      `恢复会用备份（${summary}）替换当前演练、迁移记录与历史，确定继续吗？`
+    )
+  ) {
+    return;
+  }
+  setBusy(true);
+  document.body.classList.add("busy");
+  try {
+    const data = await api("/api/backup/restore", {
+      method: "POST",
+      body: JSON.stringify(raw),
+    });
+    STATE.selectedNode = null;
+    STATE.reasonDrafts = {};
+    applyState(data);
+    showBackupError(
+      `恢复成功：${data.nodes.length} 节点 / ${data.containers.length} 容器，` +
+        `未完成排空 ${data.unfinished_drain_count} 个、进行中 ${data.active_drain_count} 个`,
+      { ok: true }
+    );
+    toast("备份已恢复，当前演练已替换", "ok");
+  } catch (error) {
+    showBackupError(error.message);
+    // The server leaves state untouched on failure; refresh to prove it.
+    await refresh();
+  } finally {
+    setBusy(false);
+    document.body.classList.remove("busy");
+    if (STATE.data) render();
+  }
+}
+
+function wireBackup() {
+  $("backup-download-btn").addEventListener("click", downloadBackup);
+  $("backup-file-input").addEventListener("change", (event) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    restoreBackup(file);
+  });
+  const label = $("backup-upload-label");
+  label.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      $("backup-file-input").click();
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Events
 // ---------------------------------------------------------------------------
 
@@ -677,10 +831,15 @@ function wireActions() {
       const reasonInput = document.querySelector(`[data-reason-for="${id}"]`);
       const reason = (reasonInput?.value || STATE.reasonDrafts[id] || "").trim() || null;
       const outcome = action === "resolve-ready" ? "ready" : "failed";
-      const data = await mutate(`/api/migrations/${id}/resolve`, {
-        outcome,
-        reason,
-      });
+      // Prefer the generation the button was rendered with; fall back to the
+      // currently displayed one. Either way the server rejects a stale page.
+      const generation = button.dataset.generation ?? STATE.generation;
+      const url =
+        `/api/migrations/${id}/resolve` +
+        (generation === undefined || generation === ""
+          ? ""
+          : `?generation=${encodeURIComponent(generation)}`);
+      const data = await mutate(url, { outcome, reason });
       if (data) {
         toast(outcome === "ready" ? "新副本已就绪，旧副本已停止" : "已模拟启动失败，旧副本继续服务", "ok");
       }
@@ -716,6 +875,7 @@ async function init() {
   wireFileInput();
   wireActions();
   wireImport();
+  wireBackup();
   await refresh({ silent: false });
   // Pause auto-refresh briefly after any interaction so re-rendering cannot
   // swallow a click that is already in flight.

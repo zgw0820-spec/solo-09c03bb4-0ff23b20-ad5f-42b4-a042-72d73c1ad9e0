@@ -57,6 +57,25 @@
         </details>
       </section>
 
+      <section class="panel" id="backup-panel">
+        <div class="panel-head">
+          <h2>备份与恢复</h2>
+          <span class="hint">JSON · 含历史与预留</span>
+        </div>
+        <div class="row gap">
+          <button class="btn ghost" id="backup-download-btn">下载备份</button>
+          <label class="btn ghost" for="backup-file-input" role="button" tabindex="0" id="backup-upload-label">
+            上传恢复
+          </label>
+          <input type="file" id="backup-file-input" accept="application/json,.json" hidden />
+        </div>
+        <p class="hint" style="margin:8px 0 0">
+          备份对应一个已提交状态（节点、业务、副本、迁移尝试、未决 CPU 预留）。
+          恢复会先校验文件及引用关系，再整体替换当前演练；文件无效或恢复失败时原状态不变。
+        </p>
+        <pre class="alert hidden" id="backup-error" role="alert"></pre>
+      </section>
+
       <section class="panel">
         <div class="panel-head">
           <h2>节点</h2>
